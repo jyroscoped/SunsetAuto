@@ -254,6 +254,36 @@ before the replacement file was created, leaving the project empty.
 **Solution:** Recreated the entire file from scratch with all accumulated
 fixes applied.
 
+### 10. AllTrails geolocation wildly inaccurate
+
+**Problem:** The original `extract_city_from_alltrails()` scraped a **city
+name** from the AllTrails page (e.g. "Boulder, Colorado") and then geocoded
+that city via Nominatim. This returned the city-centre coordinates, which
+could be **miles away** from the actual trailhead. Additionally, AllTrails
+now returns a **403** to regular browser User-Agent strings, so the scrape
+usually failed entirely.
+
+**Root cause:** Two-step indirection (scrape city name → geocode city name)
+loses precision, and AllTrails blocks non-bot UAs.
+
+**Solution:** Replaced with `extract_alltrails_location()` which:
+
+1. Requests the trail page using `User-Agent: Googlebot/2.1` — AllTrails
+   serves full server-rendered HTML (including geo meta tags) to search
+   engine crawlers.
+2. Extracts **exact trail coordinates** from
+   `<meta name="place:location:latitude">` / `longitude` (priority 1) or
+   from JSON-LD `geo.latitude` / `geo.longitude` (priority 2).
+3. Extracts a display name from JSON-LD `name` + `addressLocality`, or
+   from the `<h1>` tag.
+4. Falls back to URL-slug geocoding if scraping fails entirely.
+5. Returns `{"lat", "lng", "display"}` directly — the worker skips
+   `geocode_city()` entirely for AllTrails links, eliminating the
+   city-centre approximation.
+
+**Result:** Coordinates now match the actual trailhead (e.g. Royal Arch
+Trail → 39.99883, −105.28291 instead of Boulder city centre).
+
 ---
 
 ## Caching System

@@ -233,86 +233,126 @@ def geocode_city(city):
     }
 
 
-def extract_city_from_alltrails(url):
+def extract_alltrails_location(url):
     """
-    Scrape an AllTrails trail page and extract the city/region.
-    AllTrails URLs look like:
-        https://www.alltrails.com/trail/us/colorado/flatirons-loop
-    Strategy 1: Parse the URL path for state/region clues.
-    Strategy 2: Scrape the page for location meta content / JSON-LD.
-    """
-    path = urlparse(url).path.strip("/")
-    parts = path.split("/")
-    # typical: trail / <country> / <region> / <trail-name>
-    if len(parts) >= 3 and parts[0] == "trail":
-        region_slug = parts[2]
-        city_guess = region_slug.replace("-", " ").title()
-        state_slug = parts[1] if len(parts) >= 2 else ""
-        if len(state_slug) <= 3:
-            state_guess = state_slug.replace("-", " ").upper()
-        else:
-            state_guess = state_slug.replace("-", " ").title()
-    else:
-        city_guess, state_guess = None, None
+    Scrape an AllTrails trail page and extract the trail's exact coordinates
+    and display name.
 
+    Uses a Googlebot User-Agent because AllTrails serves full server-rendered
+    HTML to search-engine crawlers (including geo meta tags and JSON-LD),
+    while blocking or serving a JS-only shell to regular browser UAs.
+
+    Returns a dict  {"lat": float, "lng": float, "display": str}  or None.
+    """
+    lat, lng, display = None, None, None
+
+    # --- Scrape the trail page ---
     try:
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
+            # AllTrails serves full HTML (with meta geo tags) to Googlebot
+            "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "Accept": "text/html",
         }
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Try <meta name="description"> -- often has "near CityName, State"
-        meta = soup.find("meta", attrs={"name": "description"})
-        if meta and meta.get("content"):
-            content = meta["content"]
-            m = re.search(r"near\s+(.+?)[\.\,]", content, re.IGNORECASE)
-            if m:
-                return m.group(1).strip()
+        # Strategy 1 (best): <meta name="place:location:latitude"> / longitude
+        meta_lat = soup.find("meta", attrs={"name": "place:location:latitude"})
+        meta_lng = soup.find("meta", attrs={"name": "place:location:longitude"})
+        if meta_lat and meta_lng:
+            try:
+                lat = float(meta_lat["content"])
+                lng = float(meta_lng["content"])
+            except (ValueError, KeyError, TypeError):
+                pass
 
-        # Try JSON-LD structured data
+        # Strategy 2: JSON-LD  geo.latitude / geo.longitude
+        if lat is None:
+            for script_tag in soup.find_all("script", type="application/ld+json"):
+                if not script_tag.string:
+                    continue
+                try:
+                    ld = json.loads(script_tag.string)
+                    items = ld if isinstance(ld, list) else [ld]
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        geo = item.get("geo", {})
+                        if isinstance(geo, dict) and geo.get("latitude"):
+                            lat = float(geo["latitude"])
+                            lng = float(geo["longitude"])
+                            break
+                        # Also check contentLocation
+                        cl = item.get("contentLocation", {})
+                        if isinstance(cl, dict):
+                            g = cl.get("geo", {})
+                            if isinstance(g, dict) and g.get("latitude"):
+                                lat = float(g["latitude"])
+                                lng = float(g["longitude"])
+                                break
+                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                    continue
+                if lat is not None:
+                    break
+
+        # Extract a display name from JSON-LD or <h1>
         for script_tag in soup.find_all("script", type="application/ld+json"):
+            if not script_tag.string:
+                continue
             try:
                 ld = json.loads(script_tag.string)
                 items = ld if isinstance(ld, list) else [ld]
                 for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    loc = item.get("contentLocation", item.get("address", {}))
-                    if isinstance(loc, dict):
-                        city = loc.get("addressLocality") or loc.get("name")
-                        state = loc.get("addressRegion", "")
-                        if city:
-                            return (f"{city}, {state}").strip(", ")
-            except (json.JSONDecodeError, AttributeError):
+                    if isinstance(item, dict):
+                        name = item.get("name")
+                        addr = item.get("address", {})
+                        locality = ""
+                        if isinstance(addr, dict):
+                            locality = addr.get("addressLocality", "")
+                        if name:
+                            display = name + (" \u2014 " + locality if locality else "")
+                            break
+            except (json.JSONDecodeError, ValueError):
                 continue
+            if display:
+                break
 
-        # Try breadcrumb nav
-        breadcrumbs = soup.select(
-            '[class*="breadcrumb"] a, [data-testid*="breadcrumb"] a'
-        )
-        if len(breadcrumbs) >= 2:
-            return breadcrumbs[-1].get_text(strip=True)
-
-        # Heading fallback
-        h1 = soup.find("h1")
-        if h1:
-            text = h1.get_text(strip=True)
-            text = re.sub(r"\s*Trail$", "", text, flags=re.IGNORECASE)
-            if text:
-                return text
+        if not display:
+            h1 = soup.find("h1")
+            if h1:
+                display = h1.get_text(strip=True)
 
     except Exception:
         pass
 
-    if city_guess and state_guess:
-        return f"{city_guess}, {state_guess}"
-    return city_guess
+    # Strategy 3 (fallback): parse the URL slug and geocode it directly
+    # as a trail name + state, which Nominatim often knows.
+    if lat is None:
+        path = urlparse(url).path.strip("/")
+        parts = path.split("/")
+        # typical:  trail / us / colorado / royal-arch-trail
+        if len(parts) >= 4 and parts[0] == "trail":
+            trail_name = parts[-1].replace("-", " ")
+            state_slug = parts[2]
+            state = state_slug.upper() if len(state_slug) <= 3 else state_slug.replace("-", " ").title()
+            query = f"{trail_name}, {state}"
+            geo = geocode_city(query)
+            if geo:
+                lat, lng = geo["lat"], geo["lng"]
+                display = display or geo["display"]
+
+    if lat is None or lng is None:
+        return None
+
+    if not display:
+        # Last-resort display name from URL slug
+        path = urlparse(url).path.strip("/")
+        parts = path.split("/")
+        if parts:
+            display = parts[-1].replace("-", " ").title()
+
+    return {"lat": lat, "lng": lng, "display": display}
 
 
 def fetch_sunsethue_forecast(lat, lng, api_key, use_cache=True):
@@ -726,33 +766,35 @@ class SunsetAutoApp(tk.Tk):
     def _worker(self, raw, api_key):
         try:
             is_url = raw.startswith("http://") or raw.startswith("https://")
-            city = None
 
             if is_url:
-                self._set_status("Detecting location from AllTrails link...")
-                city = extract_city_from_alltrails(raw)
-                if not city:
+                self._set_status("Extracting trail location from AllTrails...")
+                loc = extract_alltrails_location(raw)
+                if not loc:
                     self._show_error(
-                        "Could not detect a city from the AllTrails link.\n"
-                        "Try entering the city name instead."
+                        "Could not extract coordinates from the AllTrails link.\n"
+                        "Try entering the trail or city name instead."
                     )
                     return
-                self._set_status("Detected location: " + city)
-            else:
-                city = raw
-
-            # Geocode
-            self._set_status("Geocoding '" + city + "'...")
-            geo = geocode_city(city)
-            if not geo:
-                self._show_error(
-                    "Could not find coordinates for '" + city + "'.\n"
-                    "Try a different spelling or a nearby major city."
+                lat, lng = loc["lat"], loc["lng"]
+                display = loc["display"]
+                self._set_status(
+                    "Trail found: " + display
+                    + "  (" + str(round(lat, 5)) + ", " + str(round(lng, 5)) + ")"
                 )
-                return
+            else:
+                # Plain city / trail name — geocode it
+                self._set_status("Geocoding '" + raw + "'...")
+                geo = geocode_city(raw)
+                if not geo:
+                    self._show_error(
+                        "Could not find coordinates for '" + raw + "'.\n"
+                        "Try a different spelling or a nearby major city."
+                    )
+                    return
+                lat, lng = geo["lat"], geo["lng"]
+                display = geo["display"]
 
-            lat, lng = geo["lat"], geo["lng"]
-            display = geo["display"]
             self._set_status(
                 "Fetching forecast for " + display
                 + "  (" + str(round(lat, 2)) + ", " + str(round(lng, 2)) + ")..."
@@ -773,7 +815,7 @@ class SunsetAutoApp(tk.Tk):
             self.after(
                 0,
                 lambda: self._render_results(
-                    data, display, lat, lng, city if is_url else None
+                    data, display, lat, lng, is_url
                 ),
             )
 
@@ -795,7 +837,7 @@ class SunsetAutoApp(tk.Tk):
 
     # -- Result rendering --
 
-    def _render_results(self, data, location, lat, lng, trail_city):
+    def _render_results(self, data, location, lat, lng, is_trail=False):
         self._clear_results()
         parent = self.results_inner
         utc_off = lng_to_utc_offset(lng)
@@ -808,8 +850,6 @@ class SunsetAutoApp(tk.Tk):
 
         # Location header
         loc_text = location
-        if trail_city:
-            loc_text = "Trail near " + trail_city + "  ->  " + location
         tk.Label(
             parent, text=loc_text,
             font=("Segoe UI", 11, "bold"), bg=self.BG, fg=self.ACCENT2,
