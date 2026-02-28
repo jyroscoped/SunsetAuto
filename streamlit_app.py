@@ -470,16 +470,31 @@ def main():
 
     # ────────────── TAB 2 : Scan nearby hikes ─────────────────────
     with tab_scan:
-        st.markdown(
-            f"**{len(HIKING_SPOTS)} curated hiking spots** within ~2.5 hrs of "
-            "Menlo Park, CA — ranked by best upcoming sunset / sunrise quality."
+        scan_city = st.text_input(
+            "City to scan around",
+            value="Menlo Park, CA",
+            placeholder="e.g. Denver, CO  or  Portland, OR",
+            key="scan_city_input",
         )
-        if st.button("🏔️  Scan All Spots",
+        is_default_city = _is_menlo_park(scan_city)
+        if is_default_city:
+            st.markdown(
+                f"**{len(HIKING_SPOTS)} curated hiking spots** within ~2.5 hrs of "
+                "Menlo Park, CA — ranked by best upcoming sunset / sunrise quality."
+            )
+        else:
+            st.markdown(
+                f"Will search for scenic / hiking spots near **{scan_city}** "
+                "and rank by best upcoming sunset / sunrise quality."
+            )
+        if st.button("🏔️  Scan Spots",
                       type="primary", use_container_width=True, key="scan_btn"):
             if not api_key:
                 st.error("Enter your SunsetHue API key in the sidebar.")
+            elif not scan_city.strip():
+                st.warning("Enter a city name to scan around.")
             else:
-                _run_scan(api_key)
+                _run_scan(api_key, scan_city.strip())
 
         if st.session_state.get("scan_payload"):
             _display_scan_results(**st.session_state.scan_payload)
@@ -574,17 +589,103 @@ def _display_check_results(data, display, lat, lng, is_trail=False):
 
 # ──────────── Scan-nearby logic ───────────────────────────────────────
 
-def _run_scan(api_key):
-    total = len(HIKING_SPOTS)
+def _is_menlo_park(city_str):
+    """Check if the user means Menlo Park (default curated list)."""
+    c = city_str.strip().lower().replace(",", "")
+    return c in ("menlo park", "menlo park ca", "menlo park california")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _find_spots_near(city):
+    """Find scenic/hiking spots near a city using Nominatim + Overpass.
+
+    Returns list of (name, lat, lng, distance_km, description) tuples.
+    """
+    # 1. Geocode the city
+    geo = geocode_city(city)
+    if not geo:
+        return [], None
+    clat, clng = geo["lat"], geo["lng"]
+
+    # 2. Search Overpass API for nature/leisure spots within 80 km
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json][timeout:25];
+    (
+      node["natural"="peak"](around:80000,{clat},{clng});
+      node["tourism"="viewpoint"](around:80000,{clat},{clng});
+      node["leisure"="nature_reserve"](around:60000,{clat},{clng});
+      way["leisure"="nature_reserve"](around:60000,{clat},{clng});
+      node["natural"="beach"](around:80000,{clat},{clng});
+      node["natural"="cliff"](around:80000,{clat},{clng});
+      relation["boundary"="national_park"](around:80000,{clat},{clng});
+      relation["leisure"="nature_reserve"](around:60000,{clat},{clng});
+    );
+    out center 80;
+    """
+    try:
+        resp = requests.post(overpass_url, data={"data": query},
+                             headers={"User-Agent": USER_AGENT}, timeout=30)
+        resp.raise_for_status()
+        elements = resp.json().get("elements", [])
+    except Exception:
+        elements = []
+
+    # 3. Build spots list, dedup by name
+    seen = set()
+    spots = []
+    for el in elements:
+        name = (el.get("tags") or {}).get("name")
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        lat = el.get("lat") or (el.get("center", {}) or {}).get("lat")
+        lng = el.get("lon") or (el.get("center", {}) or {}).get("lon")
+        if lat is None or lng is None:
+            continue
+        # distance
+        dist = math.sqrt((lat - clat)**2 + (lng - clng)**2) * 111  # rough km
+        tags = el.get("tags", {})
+        kind = tags.get("natural") or tags.get("tourism") or tags.get("leisure") or "spot"
+        ele = tags.get("ele", "")
+        desc_parts = [kind.replace("_", " ").title()]
+        if ele:
+            desc_parts.append(f"{ele}m elevation")
+        desc = " · ".join(desc_parts)
+        drive_min = round(dist / 0.9)  # rough estimate (avg ~55 km/h)
+        spots.append((name, float(lat), float(lng), drive_min, desc))
+
+    # Sort by distance, cap at 30
+    spots.sort(key=lambda s: s[3])
+    return spots[:30], geo["display"]
+
+
+def _run_scan(api_key, city="Menlo Park, CA"):
+    # Determine which spots to use
+    if _is_menlo_park(city):
+        spots = HIKING_SPOTS
+        city_label = "Menlo Park, CA"
+    else:
+        with st.spinner(f"🔍 Finding scenic spots near {city}…"):
+            found, display = _find_spots_near(city)
+        if not found:
+            st.error(f"Could not find any scenic spots near '{city}'. "
+                     "Try a larger city or check the spelling.")
+            return
+        spots = found
+        city_label = display or city
+
+    total = len(spots)
     progress = st.progress(0, text="Starting scan…")
-    status_box = st.empty()
+    error_box = st.empty()
 
     results = []
     seen_grids = set()
     api_calls = 0
     cache_hits = 0
+    first_error = None
 
-    for i, (name, lat, lng, drive, desc) in enumerate(HIKING_SPOTS):
+    for i, (name, lat, lng, drive, desc) in enumerate(spots):
         progress.progress((i + 1) / total,
                           text=f"Scanning {i+1}/{total}: {name}…")
 
@@ -599,7 +700,7 @@ def _run_scan(api_key):
         try:
             data = fetch_forecast(lat, lng, api_key)
             if is_new:
-                _time.sleep(0.15)   # gentle rate limit
+                _time.sleep(0.15)
 
             best_q, best_entry = -1, None
             for item in data.get("data", []):
@@ -622,24 +723,45 @@ def _run_scan(api_key):
                     "magics": best_entry.get("magics", {}),
                     "direction": best_entry.get("direction"),
                 })
-        except Exception:
+        except requests.HTTPError as exc:
+            if first_error is None:
+                code = exc.response.status_code if exc.response is not None else "?"
+                try:
+                    msg = exc.response.json().get("message", str(exc))
+                except Exception:
+                    msg = str(exc)
+                first_error = f"API error ({code}): {msg}"
+            # If it's an auth error, stop early — all will fail
+            if exc.response is not None and exc.response.status_code in (400, 401, 403):
+                break
+            continue
+        except Exception as exc:
+            if first_error is None:
+                first_error = str(exc)
             continue
 
     progress.empty()
-    status_box.empty()
+
+    if first_error and not results:
+        error_box.error(first_error)
+
     results.sort(key=lambda r: r["best_quality"], reverse=True)
 
     st.session_state.scan_payload = {
         "results": results,
         "api_calls": api_calls,
         "cache_hits": cache_hits,
+        "city_label": city_label,
+        "total_spots": total,
     }
 
 
-def _display_scan_results(results, api_calls, cache_hits):
-    st.markdown("### 🏆 Ranked by Best Upcoming Quality")
+def _display_scan_results(results, api_calls, cache_hits,
+                          city_label="Menlo Park, CA", total_spots=None):
+    st.markdown(f"### 🏆 Best Spots Near {city_label}")
+    scanned = total_spots if total_spots is not None else len(HIKING_SPOTS)
     cols = st.columns(3)
-    cols[0].metric("Spots scanned", len(HIKING_SPOTS))
+    cols[0].metric("Spots scanned", scanned)
     cols[1].metric("API calls", api_calls)
     cols[2].metric("Grid cache hits", cache_hits)
 
